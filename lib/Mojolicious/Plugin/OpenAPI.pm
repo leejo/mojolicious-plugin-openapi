@@ -24,11 +24,13 @@ sub register {
     $app->helper('openapi.validate'      => \&_validate);
     $app->helper('openapi.valid_input'   => \&_valid_input);
     $app->helper('openapi.spec'          => \&_helper_spec);
+    $app->helper('openapi.emulate'       => \&_emulate);
     $app->helper('reply.openapi'         => \&_reply);
     $app->hook(before_render => \&_before_render);
     push @{$app->renderer->classes}, __PACKAGE__;
   }
 
+  $self->{emulate_not_implemented} = $config->{emulate_not_implemented} || 0;
   $self->{log_level} = $ENV{MOJO_OPENAPI_LOG_LEVEL} || $config->{log_level} || 'warn';
   $self->_validator->schema($api_spec->data)->coerce($config->{coerce} // 1);
   $self->_add_routes($app, $api_spec, $config);
@@ -95,7 +97,11 @@ sub _before_render {
   return unless $has_spec or grep { $path =~ /^$_/ } @{$c->stash('openapi.base_paths')};
 
   my $format = $c->stash('format') || 'json';
-  my $res = $args->{exception} ? EXCEPTION() : !$has_spec ? NOT_FOUND() : NOT_IMPLEMENTED();
+  my $self = $c->stash('openapi.object');
+  my $res = $args->{exception} ? EXCEPTION()
+    : !$has_spec ? NOT_FOUND()
+    : $self->{emulate_not_implemented} ? $self->_emulate($c)
+    : NOT_IMPLEMENTED();
   $args->{status} = $res->{status};
   $args->{$format} = $res;
 }
@@ -104,6 +110,22 @@ sub _helper_spec {
   my ($c, $path) = @_;
   return $c->stash('openapi.op_spec') unless defined $path;
   return $c->stash('openapi.api_spec')->get($path);
+}
+
+sub _emulate {
+  my ($self, $c) = @_;
+
+  my $has_spec = $c->stash('openapi.op_spec');
+
+  if (my ($response) = grep { /^2/ } sort keys(%{$has_spec->{'responses'}})) {
+    my $schema = $has_spec->{'responses'}{$response}{schema};
+    $self->_validator->schema($schema);
+
+    # TODO: resolve the JSON schema to a data struct and return that
+  }
+
+  # no ^2 response types so default to not implemented
+  return NOT_IMPLEMENTED();
 }
 
 sub _invalid_input {
