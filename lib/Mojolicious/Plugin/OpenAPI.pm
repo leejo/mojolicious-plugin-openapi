@@ -2,6 +2,7 @@ package Mojolicious::Plugin::OpenAPI;
 use Mojo::Base 'Mojolicious::Plugin';
 
 use JSON::Validator::OpenAPI::Mojolicious;
+use JSON::Schema::ToJSON;
 use Mojo::JSON;
 use Mojo::Util 'deprecated';
 use constant DEBUG => $ENV{MOJO_OPENAPI_DEBUG} || 0;
@@ -21,11 +22,9 @@ sub register {
   my $api_spec = $self->_load_spec($app, $config);
 
   unless ($app->defaults->{'openapi.base_paths'}) {
-    $app->helper('reply.openapi'         => \&_reply);
     $app->helper('openapi.validate'    => \&_validate);
     $app->helper('openapi.valid_input' => sub { _validate($_[0]) ? undef : $_[0] });
     $app->helper('openapi.spec'        => \&_helper_spec);
-    $app->helper('openapi.emulate'       => \&_emulate);
     $app->helper('reply.openapi'       => \&_reply);
     $app->hook(before_render => \&_before_render);
     $app->renderer->add_handler(openapi => \&_render);
@@ -137,7 +136,7 @@ sub _emulate {
     my $schema = $has_spec->{'responses'}{$response}{schema};
     $self->_validator->schema($schema);
 
-    # TODO: resolve the JSON schema to a data struct and return that
+    return JSON::Schema::ToJSON->new->json_schema_to_json( schema => $schema );
   }
 
   # no ^2 response types so default to not implemented
@@ -467,6 +466,7 @@ C<route> can be specified in case you want to have a protected API. Example:
   $app->plugin(OpenAPI => {
     route => $app->routes->under("/api")->to("user#auth"),
     url   => $app->home->rel_file("cool.api"),
+    emulate_not_implemented => 0,
   });
 
 =item * spec_route_name
@@ -486,6 +486,12 @@ Can be used to overriden C</info/version> in the API specification, from the
 return value from the C<VERSION()> method in C<version_from_class>.
 
 Defaults to the current C<$app>.
+
+=item * emulate_not_implemented
+
+If set any endpoints that are not yet implemented will return "mocked" JSON
+data - this is useful in the case of prototyping. Internally this calls the
+JSON::Schema::ToJSON module.
 
 =back
 

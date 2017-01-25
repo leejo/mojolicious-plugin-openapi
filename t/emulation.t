@@ -14,8 +14,6 @@ $t->post_ok('/api/emulate')
   ->status_is(200)
   ->json_is({});
 
-note explain $t->tx->res->json;
-
 done_testing;
 
 __DATA__

@@ -15,6 +15,6 @@ WriteMakefile(
     },
   },
   BUILD_REQUIRES => {'Test::More'      => '0.88'},
-  PREREQ_PM      => {'JSON::Validator' => '0.90', 'Mojolicious' => '6.40'},
+  PREREQ_PM      => {'JSON::Validator' => '0.90', 'Mojolicious' => '6.40', 'JSON::Schema::ToJSON' => 0},
   test           => {TESTS             => (-e 'META.yml' ? 't/*.t' : 't/*.t xt/*.t')},
 );
