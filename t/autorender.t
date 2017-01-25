@@ -2,41 +2,84 @@ use Mojo::Base -strict;
 use Test::Mojo;
 use Test::More;
 
-use Mojolicious::Lite;
-
-post '/auto' => sub {
-  my $c = shift->openapi->valid_input or return;
-  return $c->reply->openapi(200 => [42]) if $c->req->json->{invalid_output};
-  return $c->render(text => 'make sure openapi.errors is part of output');
-  },
-  'Auto';
-
-plugin OpenAPI => {url => 'data://main/auto.json'};
+{
+  use Mojolicious::Lite;
+  app->routes->namespaces(['MyApp::Controller']);
+  get '/die' => sub { die 'Oh noes!' }, 'Die';
+  get
+    '/not-found' => sub { shift->reply->openapi(404 => {this_is_fine => 1}) },
+    'NotFound';
+  plugin OpenAPI => {url => 'data://main/hook.json'};
+}
 
 my $t = Test::Mojo->new;
-$t->post_ok('/api/auto' => json => ['invalid'])->status_is(400)
-  ->json_like('/errors/0/message', qr{Expected}i)->json_is('/errors/0/path', '/body');
 
-$t->post_ok('/api/auto' => json => {})->status_is(200)
-  ->content_is('make sure openapi.errors is part of output');
+# Exception
+$t->get_ok('/api/die')->status_is(500)->json_is('/errors/0/message', 'Internal server error.');
 
-$t->post_ok('/api/auto' => json => {invalid_output => 1})->status_is(500)
-  ->json_like('/errors/0/message', qr{Expected}i)->json_is('/errors/0/path', '/');
+# Not implemented
+$t->get_ok('/api/todo')->status_is(404)->json_is('/errors/0/message', 'Not found.');
+$t->post_ok('/api/todo' => json => ['invalid'])->status_is(501)
+  ->json_is('/errors/0/message', 'Not implemented.');
+
+# Implemented, but still Not found
+define_controller();
+$t->get_ok('/api/todo')->status_is(404)->json_is('/errors/0/message', 'Not found.');
+$t->post_ok('/api/todo')->status_is(200)->json_is('/todo', 42);
+
+# Custom Not Found response
+$t->get_ok('/api/not-found')->status_is(404)->json_is('/this_is_fine', 1);
 
 done_testing;
 
+sub define_controller {
+  eval <<'HERE' or die;
+  package MyApp::Controller::Dummy;
+  use Mojo::Base 'Mojolicious::Controller';
+  sub todo {
+    my $c = shift->openapi->valid_input or return;
+    $c->reply->openapi(200, {todo => 42});
+  }
+  1;
+HERE
+}
+
+package main;
 __DATA__
-@@ auto.json
+@@ hook.json
 {
   "swagger" : "2.0",
-  "info" : { "version": "0.8", "title" : "Test auto response" },
+  "info" : { "version": "0.8", "title" : "Test before_render hook" },
   "consumes" : [ "application/json" ],
   "produces" : [ "application/json" ],
   "schemes" : [ "http" ],
   "basePath" : "/api",
   "paths" : {
-    "/auto" : {
+    "/die" : {
+      "get" : {
+        "operationId" : "Die",
+        "responses" : {
+          "200": {
+            "description": "response",
+            "schema": { "type": "object" }
+          }
+        }
+      }
+    },
+    "/not-found" : {
+      "get" : {
+        "operationId" : "NotFound",
+        "responses" : {
+          "404": {
+            "description": "response",
+            "schema": { "type": "object" }
+          }
+        }
+      }
+    },
+    "/todo" : {
       "post" : {
+        "x-mojo-to": "dummy#todo",
         "operationId" : "Auto",
         "parameters" : [
           { "in": "body", "name": "body", "schema": { "type" : "object" } }

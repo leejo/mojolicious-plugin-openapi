@@ -1,11 +1,12 @@
 package Mojolicious::Plugin::OpenAPI;
 use Mojo::Base 'Mojolicious::Plugin';
 
-use JSON::Validator::OpenAPI;
+use JSON::Validator::OpenAPI::Mojolicious;
+use Mojo::JSON;
 use Mojo::Util 'deprecated';
 use constant DEBUG => $ENV{MOJO_OPENAPI_DEBUG} || 0;
 
-our $VERSION = '0.11';
+our $VERSION = '1.07';
 
 sub EXCEPTION { +{errors => [{message => 'Internal server error.', path => '/'}], status => 500} }
 sub NOT_FOUND { +{errors => [{message => 'Not found.',             path => '/'}], status => 404} }
@@ -13,25 +14,27 @@ sub NOT_IMPLEMENTED { +{errors => [{message => 'Not implemented.', path => '/'}]
 
 my $X_RE = qr{^x-};
 
-has _validator => sub { JSON::Validator::OpenAPI->new; };
+has _validator => sub { JSON::Validator::OpenAPI::Mojolicious->new; };
 
 sub register {
   my ($self, $app, $config) = @_;
   my $api_spec = $self->_load_spec($app, $config);
 
   unless ($app->defaults->{'openapi.base_paths'}) {
-    $app->helper('openapi.invalid_input' => \&_invalid_input);
-    $app->helper('openapi.validate'      => \&_validate);
-    $app->helper('openapi.valid_input'   => \&_valid_input);
-    $app->helper('openapi.spec'          => \&_helper_spec);
-    $app->helper('openapi.emulate'       => \&_emulate);
     $app->helper('reply.openapi'         => \&_reply);
+    $app->helper('openapi.validate'    => \&_validate);
+    $app->helper('openapi.valid_input' => sub { _validate($_[0]) ? undef : $_[0] });
+    $app->helper('openapi.spec'        => \&_helper_spec);
+    $app->helper('openapi.emulate'       => \&_emulate);
+    $app->helper('reply.openapi'       => \&_reply);
     $app->hook(before_render => \&_before_render);
+    $app->renderer->add_handler(openapi => \&_render);
     push @{$app->renderer->classes}, __PACKAGE__;
   }
 
   $self->{emulate_not_implemented} = $config->{emulate_not_implemented} || 0;
   $self->{log_level} = $ENV{MOJO_OPENAPI_LOG_LEVEL} || $config->{log_level} || 'warn';
+  $self->{renderer} = $config->{renderer} || \&_render_json;
   $self->_validator->schema($api_spec->data)->coerce($config->{coerce} // 1);
   $self->_add_routes($app, $api_spec, $config);
 }
@@ -50,7 +53,7 @@ sub _add_routes {
   $base_path =~ s!/$!!;
 
   push @{$app->defaults->{'openapi.base_paths'}}, $base_path;
-  $route->to({'openapi.api_spec' => $api_spec, 'openapi.object' => $self});
+  $route->to({handler => 'openapi', 'openapi.api_spec' => $api_spec, 'openapi.object' => $self});
 
   my $spec_route = $route->get->to(cb => \&_reply_spec);
   if (my $spec_route_name = $config->{spec_route_name} || $api_spec->get('/x-mojo-name')) {
@@ -60,29 +63,42 @@ sub _add_routes {
 
   for my $path (sort { length $a <=> length $b } keys %$paths) {
     next if $path =~ $X_RE;
+    my @parameters = @{$paths->{$path}{parameters} || []};
+    my $route_path = $path;
+    my $has_options;
 
     for my $http_method (keys %{$paths->{$path}}) {
-      next if $http_method =~ $X_RE;
+      next if $http_method =~ $X_RE or $http_method eq 'parameters';
       my $op_spec = $paths->{$path}{$http_method};
       my $name    = $op_spec->{'x-mojo-name'} || $op_spec->{operationId};
       my $to      = $op_spec->{'x-mojo-to'};
       my $endpoint;
 
+      $has_options = 1 if lc $http_method eq 'options';
+      $route_path = _route_path($path, $op_spec);
+
       die qq([OpenAPI] operationId "$op_spec->{operationId}" is not unique)
         if $op_spec->{operationId} and $uniq{o}{$op_spec->{operationId}}++;
       die qq([OpenAPI] Route name "$name" is not unique.) if $name and $uniq{r}{$name}++;
 
+      if (@parameters) {
+        $op_spec->{parameters} = [@parameters, @{$op_spec->{parameters} || []}];
+      }
       if ($name and $endpoint = $route->root->find($name)) {
         $route->add_child($endpoint);
       }
       if (!$endpoint) {
-        $endpoint = $route->$http_method(_route_path($path, $op_spec));
+        $endpoint = $route->$http_method($route_path);
         $endpoint->name("$route_prefix$name") if $name;
       }
 
       $endpoint->to(ref $to eq 'ARRAY' ? @$to : $to) if $to;
       $endpoint->to({'openapi.op_spec' => $op_spec});
       warn "[OpenAPI] Add route $http_method @{[$endpoint->render]}\n" if DEBUG;
+    }
+
+    unless ($has_options) {
+      $route->options($route_path => sub { _render_route_spec($_[0], $path) });
     }
   }
 }
@@ -128,29 +144,16 @@ sub _emulate {
   return NOT_IMPLEMENTED();
 }
 
-sub _invalid_input {
-  deprecated 'Use $c->openapi->validate or $c->openapi->valid_input instead';
-  goto &_validate;
-}
-
 sub _load_spec {
   my ($self, $app, $config) = @_;
-  my $openapi = JSON::Validator->new->schema(JSON::Validator::OpenAPI::SPECIFICATION_URL());
-  my ($api_spec, @errors);
 
-  # first check if $ref is in the right place,
-  # and then check if the spec is correct
-  for my $r (sub { }, undef) {
-    next if $r and $config->{allow_invalid_ref};
-    my $jv = JSON::Validator->new;
-    $jv->resolver($r) if $r;
-    $api_spec = $jv->schema($config->{url})->schema;
-    @errors   = $openapi->coerce($jv->coerce)->validate($api_spec->data);
-    die join "\n", "[OpenAPI] Invalid spec:", @errors if @errors;
-  }
-
-  warn "[OpenAPI] Loaded $config->{url}\n" if DEBUG;
-  return $api_spec;
+  return $self->_validator->load_and_validate_spec(
+    $config->{url},
+    {
+      allow_invalid_ref  => $config->{allow_invalid_ref},
+      version_from_class => $config->{version_from_class} // ref $app,
+    }
+  )->schema;
 }
 
 sub _log {
@@ -166,9 +169,10 @@ sub _log {
 }
 
 sub _reply {
-  my ($c, $status, $output) = @_;
-  my $self = $c->stash('openapi.object');
-  my $format = $c->stash('format') || 'json';
+  my $c      = shift;
+  my $status = ref $_[0] ? 200 : shift;
+  my $output = shift;
+  my @args   = @_;
 
   if (UNIVERSAL::isa($output, 'Mojo::Asset')) {
     my $h = $c->res->headers;
@@ -180,13 +184,45 @@ sub _reply {
     return $c->reply->asset($output);
   }
 
-  my @errors = $self->_validator->validate_response($c, $c->openapi->spec, $status, $output);
-  return $c->render($format => $output, status => $status) unless @errors;
-
-  $self->_log($c, '>>>', \@errors);
-  $c->render($format => {errors => \@errors, status => 500}, status => 500);
+  push @args, status => $status if $status;
+  return $c->render(@args, openapi => $output);
 }
 
+sub _render {
+  my ($renderer, $c, $output, $options) = @_;
+  exists $c->stash->{openapi} or return;
+
+  my $self = $c->stash('openapi.object') or return;
+  my $status = $c->stash('status') || 200;
+  my $res    = $c->stash('openapi');
+  my $v      = $self->_validator;
+
+  $c->stash->{format} ||= 'json';
+  delete $options->{encoding};
+
+  if (my @errors = $v->validate_response($c, $c->openapi->spec, $status, $res)) {
+    $self->_log($c, '>>>', \@errors);
+    $c->stash(status => 500);
+    $$output = $self->{renderer}->($c, {errors => \@errors, status => 500});
+  }
+  else {
+    $$output = $self->{renderer}->($c, $res);
+  }
+}
+
+sub _render_json {
+  $_[0]->res->headers->content_type('application/json;charset=UTF-8');
+  return Mojo::JSON::encode_json($_[1]);
+}
+
+sub _render_route_spec {
+  my ($c, $path) = @_;
+  my $spec   = $c->stash('openapi.api_spec')->data->{paths}{$path};
+  my $method = $c->param('method');
+  $spec = $spec->{$method} if $method;
+  return $c->render(json => $spec) if $spec;
+  return $c->render(json => {}, status => 404);
+}
 
 sub _reply_spec {
   my $c      = shift;
@@ -195,10 +231,12 @@ sub _reply_spec {
 
   local $spec->{id};
   delete $spec->{id};
-  local $spec->{host} = $c->req->url->to_abs->host_port;
+  local $spec->{basePath} = $c->url_for($spec->{basePath});
+  local $spec->{host}     = $c->req->url->to_abs->host_port;
 
   return $c->render(json => $spec) unless $format eq 'html';
   return $c->render(
+    handler   => 'ep',
     template  => 'mojolicious/plugin/openapi/layout',
     esc       => sub { local $_ = shift; s/\W/-/g; $_ },
     serialize => \&_serialize,
@@ -226,7 +264,9 @@ sub _validate {
   my ($c, $args) = @_;
   my $self    = $c->stash('openapi.object');
   my $op_spec = $c->openapi->spec;
-  my @errors  = $self->_validator->validate_request($c, $op_spec, $c->validation->output);
+
+  # Write validated data to $c->validation->output
+  my @errors = $self->_validator->validate_request($c, $op_spec, $c->validation->output);
 
   if (@errors) {
     $self->_log($c, '<<<', \@errors);
@@ -236,8 +276,6 @@ sub _validate {
 
   return @errors;
 }
-
-sub _valid_input { _validate($_[0], {}) ? undef : $_[0]; }
 
 1;
 
@@ -261,7 +299,8 @@ Mojolicious::Plugin::OpenAPI - OpenAPI / Swagger plugin for Mojolicious
     my $data = {body => $c->validation->param("body")};
 
     # Validate the output response and render it to the user agent
-    $c->reply->openapi(200 => $data);
+    # using a custom "openapi" handler.
+    $c->render(openapi => $data);
   }, "echo";
 
   # Load specification and start web server
@@ -306,8 +345,6 @@ Have a look at the L</SEE ALSO> for references to more documentation, or jump
 right to the L<tutorial|Mojolicious::Plugin::OpenAPI::Guides::Tutorial>.
 
 L<Mojolicious::Plugin::OpenAPI> will replace L<Mojolicious::Plugin::Swagger2>.
-
-This plugin is currently EXPERIMENTAL.
 
 =head1 HELPERS
 
@@ -361,17 +398,29 @@ L</SYNOPSIS> for example usage.
 
 =head2 reply.openapi
 
-  $c->reply->openapi($status => $output);
+This helper is discourage and might go away. Have a look at L</RENDERER>
+instead.
 
-Will L<validate|/openapi.validate> C<$output> before passing it on to
-L<Mojolicious::Controller/render>. Note that C<$output> will be passed on using
-the L<format|Mojolicious::Guides::Rendering/Content type> key in stash, which
-defaults to "json". This also goes for L<auto-rendering|/Controller>. Example:
+=head1 RENDERER
 
-  my $format = $c->stash("format") || "json";
-  $c->render($format => \%output);
+This plugin register a new handler called C<openapi>. The special thing about
+this handler is that it will validate the data before sending it back to the
+user agent. Examples:
 
-C<$status> is a HTTP status code.
+  $c->render(json => {foo => 123});    # without validation
+  $c->render(openapi => {foo => 123}); # with validation
+
+This handler will also use L</renderer> to format the output data. The code
+below shows the default L</renderer> which generates JSON data:
+
+  $app->plugin(
+    OpenAPI => {
+      renderer => sub {
+        my ($c, $data) = @_;
+        return Mojo::JSON::encode_json($data);
+      }
+    }
+  );
 
 =head1 METHODS
 
@@ -407,6 +456,10 @@ C<log_level> is used when logging invalid request/response error messages.
 
 Default: "warn".
 
+=item * renderer
+
+See L</RENDERER>.
+
 =item * route
 
 C<route> can be specified in case you want to have a protected API. Example:
@@ -426,6 +479,13 @@ the top level.
 
 See L<JSON::Validator/schema> for the different C<url> formats that is
 accepted.
+
+=item * version_from_class
+
+Can be used to overriden C</info/version> in the API specification, from the
+return value from the C<VERSION()> method in C<version_from_class>.
+
+Defaults to the current C<$app>.
 
 =back
 
@@ -461,39 +521,31 @@ __DATA__
 <h1 id="title"><%= $spec->{info}{title} || 'No title' %></h1>
 <p class="version"><span>Version</span> <span class="version"><%= $spec->{info}{version} %></span></p>
 
+%= include "mojolicious/plugin/openapi/toc"
+
 % if ($spec->{info}{description}) {
-<h2 id="description">Description</h2>
+<h2 id="description"><a href="#title">Description</a></h2>
 <p class="description">
   %= $spec->{info}{description}
 </p>
 % }
 
 % if ($spec->{info}{termsOfService}) {
-<h2 id="terms-of-service">Terms of service</h2>
+<h2 id="terms-of-service"><a href="#title">Terms of service</a></h2>
 <p class="terms-of-service">
   %= $spec->{info}{termsOfService}
 </p>
 % }
-
-% my $schemes = $spec->{schemes} || ["http"];
-% my $url = Mojo::URL->new("http://$spec->{host}");
-<h3 id="base-url">Base URL</h3>
-<ul>
-% for my $scheme (@$schemes) {
-  % $url->scheme($scheme);
-  <li><a href="<%= $url %>"><%= $url %></a></li>
-% }
-</ul>
 @@ mojolicious/plugin/openapi/footer.html.ep
 % my $contact = $spec->{info}{contact};
 % my $license = $spec->{info}{license};
-<h2 class="license">License</h2>
+<h2 id="license"><a href="#title">License</a></h2>
 % if ($license->{name}) {
 <p class="license"><a href="<%= $license->{url} || '' %>"><%= $license->{name} %></a></p>
 % } else {
 <p class="no-license">No license specified.</p>
 % }
-<h2 class="contact">Contact information</h2>
+<h2 id="contact"<a href="#title">Contact information</a></h2>
 % if ($contact->{email}) {
 <p class="contact-email"><a href="mailto:<%= $contact->{email} %>"><%= $contact->{email} %></a></p>
 % }
@@ -513,7 +565,7 @@ __DATA__
 @@ mojolicious/plugin/openapi/parameters.html.ep
 % my $has_parameters = @{$op->{parameters} || []};
 % my $body;
-<h3 class="op-parameters">Parameters</h3>
+<h4 class="op-parameters">Parameters</h3>
 % if ($has_parameters) {
 <table class="op-parameters">
   <thead>
@@ -551,12 +603,12 @@ __DATA__
 % for my $code (sort keys %{$op->{responses}}) {
   % next if $code =~ $X_RE;
   % my $res = $op->{responses}{$code};
-<h3 class="op-response">Response <%= $code %></h3>
+<h4 class="op-response">Response <%= $code %></h3>
 %= include "mojolicious/plugin/openapi/human", spec => $res
 <pre class="op-response"><%= $serialize->($res->{schema}) %></pre>
 % }
 @@ mojolicious/plugin/openapi/resource.html.ep
-<h3 id="op-<%= lc $method %><%= $esc->($path) %>" class="op-path <%= $op->{deprecated} ? "deprecated" : "" %>"><%= uc $method %> <%= $spec->{basePath} %><%= $path %></h3>
+<h3 id="op-<%= lc $method %><%= $esc->($path) %>" class="op-path <%= $op->{deprecated} ? "deprecated" : "" %>"><a href="#title"><%= uc $method %> <%= $spec->{basePath} %><%= $path %></a></h3>
 % if ($op->{deprecated}) {
 <p class="op-deprecated">This resource is deprecated!</p>
 % }
@@ -567,7 +619,18 @@ __DATA__
 %= include "mojolicious/plugin/openapi/parameters", op => $op
 %= include "mojolicious/plugin/openapi/response", op => $op
 @@ mojolicious/plugin/openapi/resources.html.ep
-<h2 id="resources">Resources</h2>
+<h2 id="resources"><a href="#title">Resources</a></h2>
+
+% my $schemes = $spec->{schemes} || ["http"];
+% my $url = Mojo::URL->new("http://$spec->{host}");
+<h3 id="base-url"><a href="#title">Base URL</a></h3>
+<ul class="unstyled">
+% for my $scheme (@$schemes) {
+  % $url->scheme($scheme);
+  <li><a href="<%= $url %>"><%= $url %></a></li>
+% }
+</ul>
+
 % for my $path (sort { length $a <=> length $b } keys %{$spec->{paths}}) {
   % next if $path =~ $X_RE;
   % for my $http_method (sort keys %{$spec->{paths}{$path}}) {
@@ -576,6 +639,29 @@ __DATA__
     %= include "mojolicious/plugin/openapi/resource", method => $http_method, op => $op, path => $path
   % }
 % }
+@@ mojolicious/plugin/openapi/toc.html.ep
+<ul id="toc">
+  % if ($spec->{info}{description}) {
+  <li><a href="#description">Description</a></li>
+  % }
+  % if ($spec->{info}{termsOfService}) {
+  <li><a href="#terms-of-service">Terms of service</a></li>
+  % }
+  <li>
+    <a href="#resources">Resources</a>
+    <ul>
+    % for my $path (sort { length $a <=> length $b } keys %{$spec->{paths}}) {
+      % next if $path =~ $X_RE;
+      % for my $method (sort keys %{$spec->{paths}{$path}}) {
+        % next if $method =~ $X_RE;
+        <li><a href="#op-<%= lc $method %><%= $esc->($path) %>"><span class="method"><%= uc $method %></span> <%= $spec->{basePath} %><%= $path %></h3>
+      % }
+    % }
+    </ul>
+  </li>
+  <li><a href="#license">License</a></li>
+  <li><a href="#contact">Contact</a></li>
+</ul>
 @@ mojolicious/plugin/openapi/layout.html.ep
 <!doctype html>
 <html lang="en">
@@ -588,12 +674,14 @@ __DATA__
       margin: 3em;
       padding: 0;
       color: #222;
+      line-height: 1.4em;
     }
     a {
       color: #225;
       text-decoration: underline;
     }
     h1, h2, h3, h4 { font-weight: bold; margin: 1em 0; }
+    h1 a, h2 a, h3 a, h4 a { text-decoration: none; color: #222; }
     h1 { font-size: 2em; }
     h2 { font-size: 1.6em; margin-top: 2em; }
     h3 { font-size: 1.2em; }
@@ -620,10 +708,15 @@ __DATA__
       border-bottom: 1px solid #ccc;
     }
     ul {
-      list-style: none;
       margin: 0;
+      padding: 0 1.5rem;
+    }
+    ul.unstyled {
+      list-style: none;
       padding: 0;
     }
+    #toc a { text-decoration: none; display: block; }
+    #toc .method { display: inline-block; width: 4rem; }
     div.container { max-width: 50em; margin: 0 auto; }
     p.version { color: #666; margin: -0.5em 0 2em 0; }
     p.op-deprecated { color: #c00; }

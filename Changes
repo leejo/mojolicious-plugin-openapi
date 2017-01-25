@@ -1,11 +1,53 @@
 Revision history for perl distribution Mojolicious-Plugin-OpenAPI
 
+1.07 2016-12-11T11:39:46+0100
+ - Compatible with JSON::Validator 0.90
+
+1.06 2016-11-18T15:57:26+0100
+ - Will rewrite basePath in generated spec, relative to base URL
+ - Documented x-mojo-placeholder #16
+
+1.05 2016-10-26T13:23:38+0200
+ - Add support for path parameters #11
+ - Fix typos in tutorial regarding example snippets #13
+ - Fix default OPTIONS path, when it has placeholders
+
+1.04 2016-10-06T21:39:06+0200
+ - Fix responding with an empty string #9
+ - Fix responding with null
+
+1.03 2016-09-27T23:58:41+0200
+ - Bumped required JSON::Validator version to 0.85 #8
+
+1.02 2016-09-27T09:52:02+0200
+ - Fix bug for collectionFormat handling in JSON::Validator
+ - Add support for "version_from_class"
+ - Add TOC to .html rendering of API
+
+1.01 2016-09-21T16:07:45+0200
+ - Fix documentation regarding the "reply.openapi" helper #7
+
+1.00 2016-09-04T15:08:56+0200
+ - Removed EXPERIMENTAL
+
+0.14 2016-08-20T14:04:58+0200
+ - Fix rendering UTF-8 characters
+
+0.13 2016-08-16T19:54:48+0200
+ - Removed $c->openapi->invalid_input()
+ - Add support for rendering specification on OPTIONS #1
+
+0.12 2016-08-10T21:16:54+0200
+ - Add support for $c->render(openapi => $data);
+ - Started DEPRECATING $c->reply->openapi()
+
 0.11 2016-08-09T13:35:16+0200
  - Add support for retrieving the complete API spec
  - Improved tutorial
 
 0.10 2016-08-07T22:16:38+0200
- - Replaced openapi.invalid_input() with openapi.validate()
+ - Add $c->openapi->validate()
+ - Deprecated $c->openapi->invalid_input()
  - Fix validating YAML specifications #3 #4
    Contributor: Ilya Rassadin
 

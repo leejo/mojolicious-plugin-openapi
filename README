@@ -14,7 +14,8 @@ SYNOPSIS
         my $data = {body => $c->validation->param("body")};
 
         # Validate the output response and render it to the user agent
-        $c->reply->openapi(200 => $data);
+        # using a custom "openapi" handler.
+        $c->render(openapi => $data);
       }, "echo";
 
       # Load specification and start web server
@@ -58,8 +59,6 @@ DESCRIPTION
     jump right to the tutorial.
 
     Mojolicious::Plugin::OpenAPI will replace Mojolicious::Plugin::Swagger2.
-
-    This plugin is currently EXPERIMENTAL.
 
 HELPERS
   openapi.spec
@@ -108,17 +107,28 @@ HELPERS
     "SYNOPSIS" for example usage.
 
   reply.openapi
-      $c->reply->openapi($status => $output);
+    This helper is discourage and might go away. Have a look at "RENDERER"
+    instead.
 
-    Will validate $output before passing it on to "render" in
-    Mojolicious::Controller. Note that $output will be passed on using the
-    format key in stash, which defaults to "json". This also goes for
-    auto-rendering. Example:
+RENDERER
+    This plugin register a new handler called "openapi". The special thing
+    about this handler is that it will validate the data before sending it
+    back to the user agent. Examples:
 
-      my $format = $c->stash("format") || "json";
-      $c->render($format => \%output);
+      $c->render(json => {foo => 123});    # without validation
+      $c->render(openapi => {foo => 123}); # with validation
 
-    $status is a HTTP status code.
+    This handler will also use "renderer" to format the output data. The
+    code below shows the default "renderer" which generates JSON data:
+
+      $app->plugin(
+        OpenAPI => {
+          renderer => sub {
+            my ($c, $data) = @_;
+            return Mojo::JSON::encode_json($data);
+          }
+        }
+      );
 
 METHODS
   register
@@ -151,6 +161,10 @@ METHODS
 
       Default: "warn".
 
+    * renderer
+
+      See "RENDERER".
+
     * route
 
       "route" can be specified in case you want to have a protected API.
@@ -171,6 +185,14 @@ METHODS
 
       See "schema" in JSON::Validator for the different "url" formats that
       is accepted.
+
+    * version_from_class
+
+      Can be used to overriden "/info/version" in the API specification,
+      from the return value from the "VERSION()" method in
+      "version_from_class".
+
+      Defaults to the current $app.
 
 AUTHOR
     Jan Henning Thorsen
