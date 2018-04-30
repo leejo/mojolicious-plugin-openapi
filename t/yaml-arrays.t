@@ -51,9 +51,9 @@ definitions:
                 properties:
                     city:
                         type:
-                            - string
-                            - null
+                            - "string"
+                            - "null"
                         x-example: "Villars-sur-Ollon"
                     country:
-                        type: [ 'string','null' ]
+                        type: [ "string","null" ]
                         x-example: "Villars-sur-Ollon"
